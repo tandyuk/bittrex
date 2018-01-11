@@ -13,12 +13,15 @@ class Client
 	private $apiVersion = 'v1.1';
 	private $apiKey;
 	private $apiSecret;
+	private $multiexec;
+	private $multiStack = array();
 
-	public function __construct ($apiKey, $apiSecret)
+	public function __construct ($apiKey, $apiSecret, $multiexec=false)
 	{
 		$this->apiKey    = $apiKey;
 		$this->apiSecret = $apiSecret;
 		$this->baseUrl   = 'https://bittrex.com/api/'.$this->apiVersion.'/';
+		$this->multiexec = $multiexec;  //add multiexec flag to pipeline http requests
 	}
 
 	/**
@@ -26,7 +29,7 @@ class Client
 	 * @param string $method API method to call
 	 * @param array $params parameters
 	 * @param bool $apiKey  use apikey or not
-	 * @return object
+	 * @return object or nothing if invoked with multiexec
 	 */
 	private function call ($method, $params = array(), $apiKey = false)
 	{
@@ -46,6 +49,11 @@ class Client
 		$ch = curl_init ($uri);
 		curl_setopt ($ch, CURLOPT_HTTPHEADER, array('apisign: '.$sign));
 		curl_setopt ($ch, CURLOPT_RETURNTRANSFER, true);
+		curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4); //force ipv4
+		
+		if($this->multiexec){
+			$this->multiStack[] = $ch;
+		}else{
 		$result = curl_exec($ch);
 		
 		if (curl_errno($ch)) { 
@@ -59,6 +67,49 @@ class Client
 		}
 
 		return $answer->result;
+		}
+	}
+	
+	
+	/**
+	 * Execute a set of requests
+	 * @return array
+	 */
+	public function exec ()
+	{
+		
+		// build the multi-curl handle, adding both $ch
+		$mh = curl_multi_init();
+		foreach($this->multiStack as $ch){
+			curl_multi_add_handle($mh, $ch);
+		}
+		
+		// execute all queries simultaneously, and continue when all are complete
+		$running = null;
+		do {
+			$status = curl_multi_exec($mh, $running);
+		} while ($status === CURLM_CALL_MULTI_PERFORM || $running);
+
+		
+		$responses = array();
+		foreach($this->multiStack as $ch){
+			if (curl_errno($ch)) { 
+				print curl_error($ch); die();
+			}
+			$answer = json_decode(curl_multi_getcontent($ch),true);
+			if ($answer['success'] == false) {
+				throw new \Exception ($answer['message']);
+			}
+			$responses[] = $answer['result'];
+		}		
+		//close the handles
+		foreach($this->multiStack as $ch){
+			curl_multi_remove_handle($mh, $ch);
+			curl_close($ch);
+		}
+		curl_multi_close($mh);	
+		return $responses;
+		
 	}
 
 	/**
@@ -234,7 +285,7 @@ class Client
 	 * Retrieve all balances from your account
 	 * @return array
 	 */
-	public function getBalances ()
+	public function getBalances($old=false)
 	{
 		return $this->call ('account/getbalances', array(), true);
 	}
